@@ -12,6 +12,10 @@
 #include <iostream>
 #include "protocol.h"
 
+//ViewList
+#include <mutex>
+#include <set>
+
 #define NUM_THREADS 8
 
 #define OP_RECV		1
@@ -39,6 +43,11 @@ struct Client {
 	Overlap_ex recv_overlap;
 	int packet_size;
 	int previous_size;
+	
+	set<int> view_list;
+	set<int> removedID_list;
+	mutex vl_lock;
+
 	unsigned char packet_buff[MAX_PACKET_SIZE];
 };
 
@@ -59,6 +68,16 @@ void err_display(char *msg, int id)
 	printf("[%s] %s", msg, (char *)lpMsgBuf);
 	LocalFree(lpMsgBuf);
 }
+
+bool in_range(int me, int other)
+{
+	unsigned int xDistance = abs(clients[me].avatar.x - clients[other].avatar.x);
+	unsigned int yDistance = abs(clients[me].avatar.y - clients[other].avatar.y);
+
+	return (VIEW_RADIUS >= (xDistance + yDistance)) ? true : false;
+}
+
+
 
 void Initialize()
 {
@@ -93,6 +112,26 @@ void SendPacket(int id, unsigned char* packet)
 	}
 }
 
+void send_put_player_packet(int to, int from)
+{
+	sc_packet_put_player put_player_packet;
+	put_player_packet.id = from;
+	put_player_packet.size = sizeof(put_player_packet);
+	put_player_packet.type = SC_PUT_PLAYER;
+	put_player_packet.x = clients[from].avatar.x;
+	put_player_packet.y = clients[from].avatar.y;
+	SendPacket(to, reinterpret_cast<unsigned char*>(&put_player_packet));
+}
+
+void send_remove_player_packet(int to, int from)
+{
+	sc_packet_remove_player remove_player_packet;
+	remove_player_packet.id = from;
+	remove_player_packet.size = sizeof(remove_player_packet);
+	remove_player_packet.type = SC_REMOVE_PLAYER;
+	SendPacket(to, reinterpret_cast<unsigned char*>(&remove_player_packet));
+}
+
 void ProcessPacket(int id, unsigned char buf[])
 {
 	int x = clients[id].avatar.x;
@@ -116,18 +155,72 @@ void ProcessPacket(int id, unsigned char buf[])
 	clients[id].avatar.x = x;
 	clients[id].avatar.y = y;
 
+	
 	sc_packet_pos mov_packet;
 	mov_packet.id = id;
 	mov_packet.size = sizeof(mov_packet);
 	mov_packet.type = SC_POS;
 	mov_packet.x = x;
 	mov_packet.y = y;
-
+	
+	//*******************************
+	//유저 이동 처리
 	for (auto i = 0; i < MAX_USER; ++i)
 	{
 		if (false == clients[i].is_connected) continue;
 		SendPacket(i, reinterpret_cast<unsigned char*>(&mov_packet));
 	}
+
+	//*******************************
+	//움직인 다음에서의 view&removed 확인 및 삽입
+	for (auto i = 0; i < MAX_USER; ++i)
+	{
+		if (false == clients[i].is_connected) continue;
+		if (id == i) continue;
+		if (false == in_range(id, i))
+		{
+			clients[id].vl_lock.lock();
+			clients[id].removedID_list.insert(i);
+			clients[id].view_list.erase(i);
+			clients[id].vl_lock.unlock();
+			send_remove_player_packet(id, i);
+			continue;
+		}
+
+		clients[id].vl_lock.lock();
+		clients[id].view_list.insert(i); //set을 사용하므로 중복도 알아서 처리함.
+		clients[id].removedID_list.erase(i);
+		clients[id].vl_lock.unlock();
+		send_put_player_packet(id, i);
+	}
+
+	//*******************************
+	clients[id].vl_lock.lock();
+	//만일 내 removedList에 존재한다면, 상대방 역시 내 정보를 removedList에 넣어야겠지?
+	for (auto it : clients[id].removedID_list)
+	{
+		if (false == clients[it].is_connected) continue;
+		if (id == it) continue;
+		
+		clients[it].vl_lock.lock();
+		clients[it].removedID_list.insert(id);
+		clients[it].vl_lock.unlock();
+
+		send_remove_player_packet(it, id);
+	}
+	//만일 내 viewList에 존재한다면, 상대방 역시 내 정보를 viewList에 넣어야겠다.
+	for (auto it : clients[id].view_list)
+	{
+		if (false == clients[it].is_connected) continue;
+		if (id == it) continue;
+
+		clients[it].vl_lock.lock();
+		clients[it].view_list.insert(id);	
+		clients[it].vl_lock.unlock();
+
+		send_put_player_packet(it, id);
+	}
+	clients[id].vl_lock.unlock();
 }
 
 void WorkerThreadStart()
@@ -250,8 +343,8 @@ void AcceptThreadStart()
 		}
 
 		clients[new_id].sc = new_client;
-		clients[new_id].avatar.x = 4;
-		clients[new_id].avatar.y = 4;
+		clients[new_id].avatar.x = 5;
+		clients[new_id].avatar.y = 5;
 		clients[new_id].packet_size = 0;
 		clients[new_id].previous_size = 0;
 		memset(&clients[new_id].recv_overlap.original_overlap, 0, sizeof(clients[new_id].recv_overlap.original_overlap));
